@@ -2,7 +2,7 @@
 
 [TOC]
 
-![lock01](pic/lock01.bmp)
+![lock01](pic/lock01.png)
 
 ## 设置INNODB事务隔离级别
 
@@ -263,7 +263,7 @@ transaction-isolation=read-committed
 
 ## 区分INNODB事务隔离级别
 
-![lock02](pic/lock02.bmp)
+![lock02](pic/lock02.png)
 
 InnoDB 中的隔离级详细描述：
 
