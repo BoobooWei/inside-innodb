@@ -469,5 +469,51 @@ ERROR: No query specified
 *　RR级别的会话中必须在session5的事务提交后并且自己的事务也提交后才能查到最新的行记录
 
 
+## 实现一致性锁定读
+
+InnoDB默认是可重复读的（REPEATABLE READ），MVCC多版本并发控制，实现一致性地非锁定读操作。
+
+InnoDB存储引擎的select操作使用一致性非锁定读；也就是说，select操作不会去请求共享锁S；
+
+如何显示地使用一致性锁定读呢？
+
+* 第一种方法，显式地加共享锁S：select * from t1 where id=1 lock on share mode;
+* 第二种方法，显式地加排他锁X：select * from t1 where id=1 for update;
+
+### 实践1：设置innodb申请锁等待超时时间
+
+![lock13](pic/lock13.png)
+
+```shell
+MariaDB [(none)]> set @@innodb_lock_wait_timeout=3;
+Query OK, 0 rows affected (0.01 sec)
+```
+
+### 实践2：设置一致性锁定读，加共享锁测试
+
+![lock16](pic/lock16.png)
+
+打开两个会话，分别按照图片中去做测试
+
+![lock14](pic/lock14.png)
+
+从实践中可以得到以下信息:
+
+* 事务A对id=1的行申请了共享S锁之后，事务B要么使用一致性非锁定读，即不请求锁，或者使用一致性锁定读的共享锁，即请求共享S锁
+* 而事务B中需要请求排他锁的写操作都不能执行，每次都是锁请求等待超时
+
+
+### 实践3：设置一致性锁定读，加排他锁测试
+
+![lock17](pic/lock17.png)
+
+这一次事务A以及对id=1的行申请了排他锁X，按照下图做测试：
+
+![lock15](pic/lock15.png)
+
+从实践中可以得到以下信息:
+
+* 事务A对id=1的行申请了排他锁X之后，事务B只能使用一致性非锁定读，即不请求锁
+* 而事务B中需要请求锁的行为都会等待超时，包括排他锁的写操作和共享锁的读操作都不能执行
 
 
