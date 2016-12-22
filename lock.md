@@ -517,3 +517,267 @@ Query OK, 0 rows affected (0.01 sec)
 * 而事务B中需要请求锁的行为都会等待超时，包括排他锁的写操作和共享锁的读操作都不能执行
 
 
+## 认识锁的算法
+
+nnoDB存储引擎的锁的算法有三种：
+
+* Record lock：单个行记录上的锁
+* Gap lock：间隙锁，锁定一个范围，不包括记录本身
+* Next-key lock：record+gap 锁定一个范围，包含记录本身
+
+Lock的精度（type）分为 行锁、表锁、意向锁
+
+Lock的模式（mode）分为:
+
+* 锁的类型 ——【读锁和写锁】或者【共享锁和排他锁】即 【X or S】
+* 锁的范围 ——【record lock、gap lock、Next-key lock】
+
+### 知识点
+
+1. innodb对于行的查询使用next-key lock
+2. Next-locking keying为了解决Phantom Problem幻读问题
+3. 当查询的索引含有唯一属性时，将next-key lock降级为record key
+4. Gap锁设计的目的是为了阻止多个事务将记录插入到同一范围内，而这会导致幻读问题的产生
+5. 有两种方式显式关闭gap锁：（除了外键约束和唯一性检查外，其余情况仅使用record lock）
+	A. 将事务隔离级别设置为RC
+	B. 将参数innodb_locks_unsafe_for_binlog设置为1
+
+![lock18](pic/lock18.png)
+	
+### 实践1： 验证next-key lock降级为record key
+
+创建db1.t1表，有列a和b，分别为char(10)和int型，并且b为key，注意b列为索引列，但并不是主键，因此不是唯一的。
+
+```shell
+MariaDB [db1]> create table db1.t1 (a char(10),b int,key (b));
+Query OK, 0 rows affected (0.03 sec)
+
+MariaDB [db1]> insert into db1.t1 values ('batman',1),('superman',3),('leo',5);
+Query OK, 3 rows affected (0.15 sec)
+Records: 3  Duplicates: 0  Warnings: 0
+
+MariaDB [db1]> select * from db1.t1;
++----------+------+
+| a        | b    |
++----------+------+
+| batman   |    1 |
+| superman |    3 |
+| leo      |    5 |
++----------+------+
+3 rows in set (0.02 sec)
+```
+
+接下来开启两个事务T1和T2，T1中查看b=3的行，显式加排他锁；T1未提交事务时，T2事务开启并尝试插入新行a='batman',b=2和a='batman',b=4；
+
+```shell
+#事务T1
+MariaDB [db1]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [db1]> select * from db1.t1 where b=3 for update;
++----------+------+
+| a        | b    |
++----------+------+
+| superman |    3 |
++----------+------+
+1 row in set (0.12 sec)
+
+#事务T2
+MariaDB [db1]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [db1]> insert into db1.t1 values ('batman',2);
+ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction
+MariaDB [db1]> insert into db1.t1 values ('batman',4);
+ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction
+```
+
+发现T2事务中不能插入新行a='batman',b=2和a='batman',b=4；可以查看当前innodb锁的信息
+
+```shell
+MariaDB [db1]> select * from information_schema.innodb_locks\G;
+*************************** 1. row ***************************
+    lock_id: 111B:0:334:3
+lock_trx_id: 111B
+  lock_mode: X,GAP
+  lock_type: RECORD
+ lock_table: `db1`.`t1`
+ lock_index: `b`
+ lock_space: 0
+  lock_page: 334
+   lock_rec: 3
+  lock_data: 3, 0x00000000020E
+*************************** 2. row ***************************
+    lock_id: 111A:0:334:3
+lock_trx_id: 111A
+  lock_mode: X
+  lock_type: RECORD
+ lock_table: `db1`.`t1`
+ lock_index: `b`
+ lock_space: 0
+  lock_page: 334
+   lock_rec: 3
+  lock_data: 3, 0x00000000020E
+2 rows in set (0.01 sec)
+
+ERROR: No query specified
+
+MariaDB [db1]> select * from information_schema.innodb_lock_waits\G;
+*************************** 1. row ***************************
+requesting_trx_id: 111B
+requested_lock_id: 111B:0:334:3
+  blocking_trx_id: 111A
+ blocking_lock_id: 111A:0:334:3
+1 row in set (0.09 sec)
+
+MariaDB [db1]> select * from information_schema.innodb_lock_waits\G;
+*************************** 1. row ***************************
+requesting_trx_id: 111B
+requested_lock_id: 111B:0:334:4
+  blocking_trx_id: 111A
+ blocking_lock_id: 111A:0:334:4
+1 row in set (0.00 sec)
+
+ERROR: No query specified
+
+MariaDB [db1]> select * from information_schema.innodb_locks\G;
+*************************** 1. row ***************************
+    lock_id: 111B:0:334:4
+lock_trx_id: 111B
+  lock_mode: X,GAP
+  lock_type: RECORD
+ lock_table: `db1`.`t1`
+ lock_index: `b`
+ lock_space: 0
+  lock_page: 334
+   lock_rec: 4
+  lock_data: 5, 0x00000000020F
+*************************** 2. row ***************************
+    lock_id: 111A:0:334:4
+lock_trx_id: 111A
+  lock_mode: X,GAP
+  lock_type: RECORD
+ lock_table: `db1`.`t1`
+ lock_index: `b`
+ lock_space: 0
+  lock_page: 334
+   lock_rec: 4
+  lock_data: 5, 0x00000000020F
+2 rows in set (0.11 sec)
+
+ERROR: No query specified
+```
+
+我们看到T2事务的两次插入动作都在请求排他锁，但是此时T1事务已经在加了next-key lock(record + gap)，表现范围为b的(1,5)，包括记录3，所以T2事务在T1事务解锁之间，不能插入到b的(1,5)范围内
+
+× `lock_mode: X,GAP` lock_mode 可以理解为 `读锁还是写锁？`；`是在什么范围上锁？`;此处加的写锁即排他锁；范围是(1,5)
+* `lock_type: RECORD` 表示锁的精度，根据存储引擎不同，innodb是行锁，MYISAM是表锁
+
+删除db1.t1表，重新创建db1.t1表，有列a和b，分别为char(10)和int型，并且b为primay key，因此b列是唯一的。
+
+```shell
+MariaDB [db1]> drop tables t1;
+Query OK, 0 rows affected (0.12 sec)
+
+MariaDB [db1]> create table db1.t1 (a char(10),b int ,primary key (b));
+Query OK, 0 rows affected (0.02 sec)
+
+MariaDB [db1]> insert into db1.t1 values ('batman',1),('superman',3),('leo',5);
+Query OK, 3 rows affected (0.12 sec)
+Records: 3  Duplicates: 0  Warnings: 0
+
+MariaDB [db1]> select * from db1.t1;
++----------+---+
+| a        | b |
++----------+---+
+| batman   | 1 |
+| superman | 3 |
+| leo      | 5 |
++----------+---+
+3 rows in set (0.08 sec)
+```
+
+接下来开启两个事务T1和T2，T1中查看b=3的行，显式加排他锁；T1未提交事务时，T2事务开启并尝试插入新行a='batman',b=2和a='batman',b=4；
+
+```shell
+#事务T1
+MariaDB [db1]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [db1]> select * from db1.t1 where b=3 for update;
++----------+---+
+| a        | b |
++----------+---+
+| superman | 3 |
++----------+---+
+1 row in set (0.14 sec)
+
+#事务T2
+MariaDB [db1]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [db1]> insert into db1.t1 values ('batman',2);
+Query OK, 1 row affected (0.00 sec)
+
+MariaDB [db1]> insert into db1.t1 values ('batman',4);
+Query OK, 1 row affected (0.00 sec)
+```
+
+继续在T2事务中尝试查看b=3的行，显式加共享锁。
+
+```shell
+#事务T2
+MariaDB [db1]> select * from db1.t1 where b=3 lock in share mode;
+ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction
+```
+
+发现T2事务中可以插入新行a='batman',b=2和a='batman',b=4；但是不能查看b=3的行，接下来我们查看当前innodb锁的信息
+
+```shell
+MariaDB [db1]> select * from information_schema.innodb_locks\G;
+*************************** 1. row ***************************
+    lock_id: 1122:0:337:3
+lock_trx_id: 1122
+  lock_mode: S
+  lock_type: RECORD
+ lock_table: `db1`.`t1`
+ lock_index: `PRIMARY`
+ lock_space: 0
+  lock_page: 337
+   lock_rec: 3
+  lock_data: 3
+*************************** 2. row ***************************
+    lock_id: 1121:0:337:3
+lock_trx_id: 1121
+  lock_mode: X
+  lock_type: RECORD
+ lock_table: `db1`.`t1`
+ lock_index: `PRIMARY`
+ lock_space: 0
+  lock_page: 337
+   lock_rec: 3
+  lock_data: 3
+2 rows in set (0.02 sec)
+
+ERROR: No query specified
+
+MariaDB [db1]> select * from information_schema.innodb_lock_waits\G;
+*************************** 1. row ***************************
+requesting_trx_id: 1122
+requested_lock_id: 1122:0:337:3
+  blocking_trx_id: 1121
+ blocking_lock_id: 1121:0:337:3
+1 row in set (0.00 sec)
+
+ERROR: No query specified
+```
+
+从以上信息可以看到，T1事务当前只在b=3所在的行上加了写锁，排他锁，并没有同时使用gap锁来组成next-key lock。
+
+到此，已经证明了，当查询的索引含有唯一属性时，将next-key lock降级为record key
+
+我们第二次创建的t1表的列b是主键，而主键必须是唯一的。
+
+
+### 实践2： 关闭GAP锁
+
