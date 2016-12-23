@@ -265,14 +265,14 @@ transaction-isolation=read-committed
 
 ![lock02](pic/lock02.png)
 
-InnoDB 中的隔离级详细描述：
+### InnoDB 中的隔离级详细描述
 
 - `READ UNCOMMITTED` 这通常称为 'dirty read'：non-locking SELECTs 的执行使我们不会看到一个记录的可能更早的版本；因而在这个隔离度下是非 'consistent' reads；另外，这级隔离的运作如同 READ COMMITTED。
 - `READ COMMITTED` 有些类似 Oracle 的隔离级。所有 SELECT ... FOR UPDATE 和 SELECT ... LOCK IN SHARE MODE 语句只锁定索引记录，而不锁定之前的间隙，因而允许在锁定的记录后自由地插入新记录。以一个唯一地搜索条件使用一个唯一索引(unique index)的 UPDATE 和 DELETE，仅仅只锁定所找到的索引记录，而不锁定该索引之前的间隙。但是在范围型的 UPDATE and DELETE中，InnoDB 必须设置 next-key 或 gap locks 来阻塞其它用户对范围内的空隙插入。 自从为了 MySQL 进行复制(replication)与恢复(recovery)工作'phantom rows'必须被阻塞以来，这就是必须的了。Consistent reads 运作方式与 Oracle 有点类似： 每一个 consistent read，甚至是同一个事务中的，均设置并作用它自己的最新快照。
 - `REPEATABLE READ` 这是 InnoDB 默认的事务隔离级。. SELECT ... FOR UPDATE, SELECT ... LOCK IN SHARE MODE, UPDATE, 和 DELETE ，这些以唯一条件搜索唯一索引的，只锁定所找到的索引记录，而不锁定该索引之前的间隙。 否则这些操作将使用 next-key 锁定，以 next-key 和 gap locks 锁定找到的索引范围，并阻塞其它用户的新建插入。在 consistent reads 中，与前一个隔离级相比这是一个重要的差别： 在这一级中，同一事务中所有的 consistent reads 均读取第一次读取时已确定的快照。这个约定就意味着如果在同一事务中发出几个无格式(plain)的SELECTs ，这些 SELECTs 的相互关系是一致的。
 - `SERIALIZABLE` 这一级与上一级相似，只是无格式(plain)的 SELECTs 被隐含地转换为 SELECT ... LOCK IN SHARE MODE。
 
----
+### 实践1：SERIALIZABLE隔离级别查询自动加共享锁
 
 * 开启四个会话session1-4，分别设置不同的隔离级别
 
@@ -453,6 +453,8 @@ ERROR: No query specified
 * session4中提交事务，则id=100的行锁被解除，我们关闭session4，下图为最新的情况
 
 ![lock07](pic/lock07.png)
+
+### 实践2：RU、RC、RR隔离级别的对比
 
 * session5，修改id=100的行，改为200，不提交事务，session1-,3分别查看id=100的值，观察情况
 
@@ -779,5 +781,107 @@ ERROR: No query specified
 我们第二次创建的t1表的列b是主键，而主键必须是唯一的。
 
 
-### 实践2： 关闭GAP锁
+### 实践2： 关闭GAP锁_RC
 
+有两种方式显式关闭gap锁：（除了外键约束和唯一性检查外，其余情况仅使用record lock）
+
+A. 将事务隔离级别设置为RC
+B. 将参数innodb_locks_unsafe_for_binlog设置为1
+	
+|T1 RR|T2 RR|
+|:--|:--|
+|begin;|begin;|
+|select * from db1.t1 where b=3 for update;||
+||insert into db1.t1 values ('batman',2)|
+||ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction|
+||set session transaction isolation level READ COMMITTED;|
+|commit;|commit;|
+
+注意，将T1事务设置为RC后，需要将二进制日志的格式改为row格式，否则执行显式加锁时会报错
+
+```shell
+MariaDB [db1]> insert into t1 values ('batman',2);
+ERROR 1665 (HY000): Cannot execute statement: impossible to write to binary log since BINLOG_FORMAT = STATEMENT and at least one table uses a storage engine limited to row-based logging. InnoDB is limited to row-logging when transaction isolation level is READ COMMITTED or READ UNCOMMITTED.
+```
+
+
+|T1 RC|T2 RR|
+|:--|:--|
+|begin;|begin;|
+|set session transaction isolation level READ COMMITTED;||
+|select * from db1.t1 where b=3 for update;||
+||insert into db1.t1 values ('batman',2)|
+||insert into db1.t1 values ('batman',4)|
+|commit;|commit;|
+
+
+```shell
+#T1事务
+MariaDB [db1]> set session transaction isolation level READ COMMITTED;
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [db1]> select @@tx_isolation;
++----------------+
+| @@tx_isolation |
++----------------+
+| READ-COMMITTED |
++----------------+
+1 row in set (0.00 sec)
+
+MariaDB [db1]> begin;
+Query OK, 0 rows affected (0.09 sec)
+
+MariaDB [db1]> select * from t1 where b=3 for update;
++----------+------+
+| a        | b    |
++----------+------+
+| superman |    3 |
++----------+------+
+1 row in set (0.00 sec)
+
+#T2事务
+MariaDB [db1]> begin;
+Query OK, 0 rows affected (0.16 sec)
+
+MariaDB [db1]> select @@tx_isolation;
++----------------+
+| @@tx_isolation |
++----------------+
+| READ-COMMITTED |
++----------------+
+1 row in set (0.00 sec)
+
+MariaDB [db1]> insert into db1.t1 values ('batman',2);
+Query OK, 1 row affected (0.00 sec)
+
+MariaDB [db1]> commit;
+Query OK, 0 rows affected (0.01 sec)
+
+MariaDB [db1]> set session transaction isolation level REPEATABLE READ;
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [db1]> select @@tx_isolation;
++-----------------+
+| @@tx_isolation  |
++-----------------+
+| REPEATABLE-READ |
++-----------------+
+1 row in set (0.00 sec)
+
+MariaDB [db1]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [db1]> insert into db1.t1 values ('batman',4);
+Query OK, 1 row affected (0.00 sec)
+
+MariaDB [db1]> commit;
+Query OK, 0 rows affected (0.00 sec)
+
+#T1事务
+MariaDB [db1]> commit;
+Query OK, 0 rows affected (0.00 sec)
+```
+
+我在做测试的时候，T1事务隔离界别为RC，T2事务的隔离界别分别用RC和RR做了测试，都是可以的
+
+### 实践3： 关闭GAP锁_innodb_locks_unsafe_for_binlog
