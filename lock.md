@@ -885,3 +885,243 @@ Query OK, 0 rows affected (0.00 sec)
 我在做测试的时候，T1事务隔离界别为RC，T2事务的隔离界别分别用RC和RR做了测试，都是可以的
 
 ### 实践3： 关闭GAP锁_innodb_locks_unsafe_for_binlog
+
+
+查看当前innodb_locks_unsafe_for_binlog参数的值
+
+```shell
+MariaDB [(none)]> select @@innodb_locks_unsafe_for_binlog;
++----------------------------------+
+| @@innodb_locks_unsafe_for_binlog |
++----------------------------------+
+|                                0 |
++----------------------------------+
+1 row in set (0.00 sec)
+```
+
+修改参数，并重新启动服务
+
+```shell
+[root@localhost ~]# vim /etc/my.cnf
+innodb_locks_unsafe_for_binlog=1
+[root@localhost ~]# systemctl restart mariadb
+
+[root@localhost ~]# mysql -e "select @@innodb_locks_unsafe_for_binlog"
++----------------------------------+
+| @@innodb_locks_unsafe_for_binlog |
++----------------------------------+
+|                                1 |
++----------------------------------+
+```
+
+还是去创建db1.t1表，如果已有就先drop；有列a和b，分别为char(10)和int型，并且b为key，注意b列为索引列，但并不是主键，因此不是唯一的。
+
+
+|T1 RR|T2 RR|
+|:--|:--|
+|begin;|begin;|
+|select * from db1.t1 where b=3 for update;||
+||insert into db1.t1 values ('batman',2)|
+||insert into db1.t1 values ('batman',4)|
+|commit;|commit;|
+
+```shell
+MariaDB [db1]> create table db1.t1 (a char(10),b int,key (b));
+Query OK, 0 rows affected (0.03 sec)
+
+MariaDB [db1]> insert into db1.t1 values ('batman',1),('superman',3),('leo',5);
+Query OK, 3 rows affected (0.15 sec)
+Records: 3  Duplicates: 0  Warnings: 0
+
+MariaDB [db1]> select * from db1.t1;
++----------+------+
+| a        | b    |
++----------+------+
+| batman   |    1 |
+| superman |    3 |
+| leo      |    5 |
++----------+------+
+3 rows in set (0.02 sec)
+```
+
+接下来开启两个事务T1和T2，T1中查看b=3的行，显式加排他锁；T1未提交事务时，T2事务开启并尝试插入新行a='batman',b=2和a='batman',b=4；
+
+T1事务
+
+```shell
+MariaDB [(none)]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> select * from db1.t1 where b=3 for update;
++----------+------+
+| a        | b    |
++----------+------+
+| superman |    3 |
++----------+------+
+1 row in set (0.01 sec)
+```
+
+T2事务
+
+```shell
+MariaDB [(none)]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> insert into db1.t1 values ('batman',4);
+Query OK, 1 row affected (0.01 sec)
+
+MariaDB [(none)]> insert into db1.t1 values ('batman',2);
+Query OK, 1 row affected (0.00 sec)
+
+MariaDB [(none)]> commit;
+Query OK, 0 rows affected (0.00 sec)
+```
+
+T1事务
+
+```shell
+MariaDB [(none)]> commit;
+Query OK, 0 rows affected (0.00 sec)
+```
+
+### 实践4：next-key locking是如何解决幻读问题的
+
+![lock19](pic/lock19.png)
+
+首先什么是幻读呢？ 
+
+举个例子，两个男孩同时在追求一个女生的故事
+
+A问：你有男朋友吗？女孩对他说没有。A追求女孩的事件还没有提交，就是继续追求哈。
+
+就在A追求的同时，B也在追求，并且直接让女孩做他的女朋友，女孩答应了，B的追求事件结束。
+
+A又问：你有男朋友吗？ 女孩对他说我已经有男朋友了！ 呜呜呜 ！刚才你还没有的，怎么现在就有了呢？
+
+女孩说，你也没说过你追我的时候不让别人追我啊！... ... A哭着走了。
+
+
+**幻读 Phantom Problem 是指在同一事务下，连续执行两次相同的sql语句可能导致不同的结果，第二次的sql语句可能会返回之前不存在的行。**
+
+在刚才我举的例子里，A虽然问了女孩有没有男朋友，但是没有告诉女孩，在他追求时，不可以接受别人的追求，所以悲催的结局。
+
+那么A怎么才能在他追求事件结束前让女孩不答应别人的追求呢？
+
+innodb中的RR隔离级别是通过next-key locking是如何解决幻读问题的，就是锁住一个范围。
+
+那么如果你是A你怎么做呢？你肯定要跟女孩说，只要我开始追求你，问了你有没有男朋友，在我结束追求你之前，你不可以答应别人的追求！我要把你脑子里记录男朋友的区域全部锁起来，啊哈啊！
+
+下面我们来做一个测试，分别在RR和RC隔离级别中来实现：
+
+测试使用表db1.t1 (a int primary key) ,记录有1,3,5
+
+|T1 RC|T2 RR|
+|:--|:--|
+|begin;|begin;|
+|set session transaction isolation level READ COMMITTED;||
+|select * from db1.t1 where a>3 for update;||
+|查询结果为5||
+||insert into db1.t1 values (4);|
+||commit;|
+|select * from db1.t1 where a>3;||
+|查询结果为4 5||
+
+```shell
+MariaDB [db1]> create table t1 (a int primary key);
+Query OK, 0 rows affected (0.22 sec)
+
+MariaDB [db1]> insert into t1 values (1),(3),(5);
+Query OK, 3 rows affected (0.02 sec)
+Records: 3  Duplicates: 0  Warnings: 0
+
+#事务T1
+MariaDB [db1]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [db1]> set session transaction isolation level read co
+Query OK, 0 rows affected (0.01 sec)
+
+MariaDB [db1]> select * from db1.t1 where a>3 for update;
++---+
+| a |
++---+
+| 5 |
++---+
+1 row in set (0.01 sec)
+
+#事务T2
+MariaDB [db1]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [db1]> insert into db1.t1 values (4);
+Query OK, 1 row affected (0.00 sec)
+
+MariaDB [db1]> commit;
+Query OK, 0 rows affected (0.03 sec)
+
+#事务T1
+MariaDB [db1]> select * from db1.t1 where a>3 for update;
++---+
+| a |
++---+
+| 4 |
+| 5 |
++---+
+2 rows in set (0.00 sec)
+```
+
+
+将会话中的隔离界别改为RR，并删除a=4记录。
+
+```shell
+MariaDB [db1]> set session transaction isolation level repeatable read;
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [db1]> delete from db1.t1 where a=4;
+Query OK, 1 row affected (0.00 sec)
+```
+
+|T1 RR|T2 RR|
+|:--|:--|
+|begin;|begin;|
+|select * from db1.t1 where a>3 for update;||
+|查询结果为5||
+||insert into db1.t1 values (4);|
+||ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction|
+||commit;|
+|select * from db1.t1 where a>3;||
+|查询结果为5||
+
+```shell
+#事务T1
+MariaDB [(none)]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> select * from db1.t1 where a>3 for update;
++---+
+| a |
++---+
+| 5 |
++---+
+1 row in set (0.02 sec)
+
+#事务T2
+MariaDB [(none)]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> insert into db1.t1 values (4);
+ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction
+MariaDB [(none)]> commit;
+Query OK, 0 rows affected (0.00 sec)
+
+#事务T1
+MariaDB [(none)]> select * from db1.t1 where a>3 for update;
++---+
+| a |
++---+
+| 5 |
++---+
+1 row in set (0.02 sec)
+
+```
+
